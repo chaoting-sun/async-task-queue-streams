@@ -1,18 +1,18 @@
 # Redis Streams Task Queue
 
-A production-grade task queue implementation using Redis Streams, demonstrating consumer groups, automatic recovery, and exactly-once delivery semantics.
+A task queue built on Redis Streams with consumer groups, automatic stale-message recovery, bounded retries with a dead letter queue, graceful shutdown, and built-in observability.
 
-## Project Goals
+## Features
 
-This project demonstrates:
+- **Redis Streams** as the message broker (append-only log with retained history)
+- **Consumer Groups** for distributed, load-balanced task processing (`XREADGROUP`)
+- **Automatic recovery** of messages from crashed or slow workers (`XAUTOCLAIM`)
+- **Bounded retries** using native `times_delivered` tracking (`XPENDING`)
+- **Dead Letter Queue** stream for messages that exceed max retries
+- **Graceful shutdown** on `SIGTERM`/`SIGINT` — in-flight tasks finish before exit
+- **Health endpoint** exposing stream depth, consumer lag, pending messages, and alerts
 
-1. **Redis Streams** as a message broker (vs Lists in `async-task-queue`)
-2. **Consumer Groups** for distributed task processing
-3. **Built-in recovery** using `XAUTOCLAIM` (replacing custom reaper)
-4. **Exactly-once delivery** with atomic acknowledgment
-5. **Observability** with native Stream introspection
-
-## Architecture Overview
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -26,356 +26,101 @@ This project demonstrates:
 │         │                     │              │  │ W1 │ │ W2 │ │ W3 ││   │
 │         │                     │              │  └────┘ └────┘ └────┘│   │
 │         ▼                     ▼              └──────────────────────┘   │
-│     POST /task            XREADGROUP                                    │
-│     GET /status           XACK / XAUTOCLAIM                             │
-│                                                                         │
+│     POST /process-image   XREADGROUP                                    │
+│     GET  /status          XACK / XAUTOCLAIM                             │
+│     GET  /health                                                        │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Lists vs Streams Comparison
+## How It Works
 
-| Aspect                 | Lists (`async-task-queue`)              | Streams (This Project)             |
-| ---------------------- | --------------------------------------- | ---------------------------------- |
-| **Message Delivery**   | `BLMOVE` (atomic but 2-step with ZADD)  | `XREADGROUP` (single operation)    |
-| **Consumer Tracking**  | Custom `processing_zset` + lease tokens | Built-in consumer groups           |
-| **Visibility Timeout** | Custom sorted set + Lua scripts         | Built-in with `XPENDING` idle time |
-| **Stale Recovery**     | Custom `reaper.py` (~135 lines)         | `XAUTOCLAIM` (one command)         |
-| **Retry Counting**     | Manual in task data                     | Automatic `times_delivered`        |
-| **Atomicity**          | 5 custom Lua scripts                    | Native commands                    |
-| **Message History**    | Lost after pop                          | Retained until trimmed             |
-| **Observability**      | Manual implementation                   | `XINFO` commands                   |
+1. **Produce**: `POST /process-image` writes task metadata to `task:data:{task_id}` and appends a message to `task_stream` via `XADD`.
+2. **Consume**: Each worker calls `XREADGROUP` with its consumer name, pulling one new message at a time. The message stays in the Pending Entries List (PEL) until acknowledged.
+3. **Recover**: Before reading new work, each worker calls `XAUTOCLAIM` to take over any PEL entries idle longer than `STALE_MESSAGE_THRESHOLD_MS` — replacing the custom reaper pattern required with Redis Lists.
+4. **Retry / DLQ**: On failure, the message is left in the PEL so `XAUTOCLAIM` retries it. Once `times_delivered >= MAX_RETRIES`, the worker re-publishes it to `dead_letter_stream` with error context and acknowledges the original.
+5. **Shutdown**: On `SIGTERM`/`SIGINT` the main loop exits after the current task finishes. Docker Compose gives each worker `stop_grace_period: 30s`.
 
 ## Project Structure
 
 ```
 async-task-queue-streams/
 ├── docker-compose.yml
-├── README.md
-├── spec/
-│   ├── ARCHITECTURE.md          # System design diagrams
-│   ├── STREAMS-CONCEPTS.md      # Redis Streams fundamentals
-│   ├── CONSUMER-GROUPS.md       # Consumer group patterns
-│   └── COMPARISON.md            # Lists vs Streams deep dive
 ├── app/
+│   ├── main.py                  # FastAPI producer + /health endpoint
 │   ├── Dockerfile
-│   ├── main.py                  # FastAPI producer (XADD)
 │   └── requirements.txt
-└── worker/
-    ├── Dockerfile
-    ├── __init__.py
-    ├── __main__.py
-    ├── worker.py                # Main worker loop
-    ├── stream_manager.py        # Stream operations abstraction
-    ├── task_processor.py        # Task execution logic
-    ├── config.py                # Configuration
-    ├── redis_client.py          # Redis connection
-    └── requirements.txt
+├── worker/
+│   ├── worker.py                # Main loop: recovery → claim → process → ack
+│   ├── stream_manager.py        # XADD / XREADGROUP / XACK / XAUTOCLAIM / XPENDING / XINFO
+│   ├── task_processor.py        # Task execution + status updates
+│   ├── config.py                # Env-driven configuration
+│   ├── redis_client.py
+│   ├── __main__.py
+│   └── Dockerfile
+└── spec/                        # Design notes (architecture, streams concepts, comparison)
 ```
 
-## Implementation Phases
-
-### Phase 1: Core Stream Implementation
-
-**Goal**: Working task queue with Redis Streams basics
-
-**Components**:
-
-- [ ] Producer API with `XADD`
-- [ ] Consumer group initialization
-- [ ] Worker loop with `XREADGROUP`
-- [ ] Basic `XACK` acknowledgment
-- [ ] Task status storage
-
-**Key Concepts**:
-
-- Stream as append-only log
-- Consumer group membership
-- Message ID structure (`<timestamp>-<sequence>`)
-- Pending Entries List (PEL)
-
-**Intentionally Deferred**:
-
-- Stale message recovery
-- Retry logic
-- Dead letter queue
-- Graceful shutdown
-
-```
-┌──────────┐     XADD      ┌─────────────┐    XREADGROUP    ┌──────────┐
-│ Producer │──────────────▶│ task_stream │◀─────────────────│  Worker  │
-└──────────┘               └─────────────┘                  └──────────┘
-                                                                  │
-                                                             XACK │
-                                                                  ▼
-                                                           [Completed]
-```
-
----
-
-### Phase 2: Stale Message Recovery
-
-**Goal**: Automatic recovery of messages from crashed workers
-
-**Components**:
-
-- [ ] `XAUTOCLAIM` implementation
-- [ ] Recovery loop in worker
-- [ ] Idle time threshold configuration
-
-**Key Concepts**:
-
-- Pending Entries List (PEL) tracking
-- Message idle time
-- Ownership transfer between consumers
-- Compare to custom reaper elimination
-
-```
-Worker 1 crashes after XREADGROUP, before XACK
-                │
-                ▼
-        ┌───────────────┐
-        │     PEL       │  Message stuck, idle time increasing
-        │  msg_id: 123  │
-        │  idle: 45000  │
-        └───────────────┘
-                │
-                │  XAUTOCLAIM (idle > 30000ms)
-                ▼
-        ┌───────────────┐
-        │   Worker 2    │  Claims ownership, reprocesses
-        └───────────────┘
-```
-
----
-
-### Phase 3: Retry Logic & Dead Letter Queue
-
-**Goal**: Bounded retries with failed message preservation
-
-**Components**:
-
-- [ ] Delivery count tracking via `XPENDING`
-- [ ] Max retry threshold
-- [ ] Dead letter stream (`dead_letter_stream`)
-- [ ] Failed task status updates
-
-**Key Concepts**:
-
-- `times_delivered` automatic tracking
-- Separating recoverable vs permanent failures
-- DLQ as a stream (not list) for consistency
-- Retry backoff strategies (optional)
-
-```
-                    ┌─────────────────────────────────────┐
-                    │          task_stream                │
-                    └─────────────────────────────────────┘
-                                     │
-                                     │ XREADGROUP
-                                     ▼
-                              ┌─────────────┐
-                              │   Process   │
-                              └─────────────┘
-                                     │
-                    ┌────────────────┼────────────────┐
-                    │                │                │
-                    ▼                ▼                ▼
-               [Success]        [Failure]        [Failure]
-                  │           (retry < MAX)     (retry >= MAX)
-                  │                │                │
-                XACK          Don't ACK           XADD
-                  │           (stay in PEL)         │
-                  ▼                │                ▼
-             [Complete]            │      ┌─────────────────┐
-                                   │      │ dead_letter_    │
-                                   │      │ stream          │
-                                   │      └─────────────────┘
-                                   │                │
-                                   └──── XAUTOCLAIM ┘
-                                         (later)
-```
-
----
-
-### Phase 4: Graceful Shutdown
-
-**Goal**: Clean worker termination without message loss
-
-**Components**:
-
-- [ ] Signal handling (SIGTERM, SIGINT)
-- [ ] Current task completion before exit
-- [ ] Consumer deregistration (optional)
-
-**Key Concepts**:
-
-- Docker `stop_grace_period`
-- In-flight message handling
-- Consumer group rebalancing
-
-```
-                    SIGTERM received
-                           │
-                           ▼
-               ┌───────────────────────┐
-               │  Set running = False  │
-               └───────────────────────┘
-                           │
-                           ▼
-               ┌───────────────────────┐
-               │ Complete current task │
-               │ (if any in progress)  │
-               └───────────────────────┘
-                           │
-                           ▼
-               ┌───────────────────────┐
-               │  ACK if completed     │
-               │  Leave in PEL if not  │
-               └───────────────────────┘
-                           │
-                           ▼
-               ┌───────────────────────┐
-               │   Exit gracefully     │
-               └───────────────────────┘
-```
-
----
-
-### Phase 5: Observability & Monitoring
-
-**Goal**: Production-ready visibility into queue health
-
-**Components**:
-
-- [ ] Stream info endpoint (`XINFO STREAM`)
-- [ ] Consumer group stats (`XINFO GROUPS`)
-- [ ] Per-consumer metrics (`XINFO CONSUMERS`)
-- [ ] Pending message inspection (`XPENDING`)
-- [ ] Health check endpoint
-
-**Key Concepts**:
-
-- Queue depth monitoring
-- Consumer lag detection
-- Stale message alerts
-- Integration with monitoring systems
-
-```
-GET /health
-{
-  "stream": {
-    "length": 150,
-    "first_entry_id": "1708000000000-0",
-    "last_entry_id": "1708001234567-0"
-  },
-  "consumer_group": {
-    "name": "workers",
-    "pending": 5,
-    "consumers": 3,
-    "last_delivered_id": "1708001234560-0"
-  },
-  "consumers": [
-    {"name": "worker-abc123", "pending": 2, "idle": 1500},
-    {"name": "worker-def456", "pending": 2, "idle": 800},
-    {"name": "worker-ghi789", "pending": 1, "idle": 200}
-  ]
-}
-```
-
----
-
-### Phase 6: Production Hardening (Optional)
-
-**Goal**: Scale and reliability optimizations
-
-**Components**:
-
-- [ ] Stream trimming (`MAXLEN` / `MINID`)
-- [ ] Batch message processing
-- [ ] Redis persistence configuration
-- [ ] Connection pooling
-- [ ] Metrics export (Prometheus format)
-
-**Key Concepts**:
-
-- Memory management
-- Throughput optimization
-- Data durability trade-offs
-
----
-
-## Feature Summary by Phase
-
-| Phase | Features                    | Complexity | Lines of Code |
-| ----- | --------------------------- | ---------- | ------------- |
-| **1** | Basic produce/consume, XACK | Low        | ~200          |
-| **2** | XAUTOCLAIM recovery         | Low        | +40           |
-| **3** | Retry counting, DLQ         | Medium     | +60           |
-| **4** | Graceful shutdown           | Low        | +30           |
-| **5** | XINFO observability         | Medium     | +50           |
-| **6** | Trimming, batching, metrics | Medium     | +50           |
-
-**Total estimated**: ~430 lines (vs ~600 in Lists implementation)
-
----
-
-## Key Interview Discussion Points
-
-### Phase 1
-
-- How does `XREADGROUP` differ from `BLMOVE`?
-- What is the Pending Entries List (PEL)?
-- Why consumer groups over competing consumers?
-
-### Phase 2
-
-- How does `XAUTOCLAIM` replace the custom reaper?
-- What determines "stale" in Streams vs sorted set scores?
-- Race condition comparison between approaches
-
-### Phase 3
-
-- How does `times_delivered` work automatically?
-- Why use a stream for DLQ instead of a list?
-- Idempotency considerations for retried tasks
-
-### Phase 4
-
-- What happens to pending messages on crash vs graceful shutdown?
-- How does Docker orchestrate the shutdown sequence?
-
-### Phase 5
-
-- What metrics indicate unhealthy queue state?
-- How to detect slow consumers?
-- Consumer lag vs queue depth
-
----
-
-## Quick Start (After Implementation)
+## Quick Start
 
 ```bash
-# Start all services
+# Start Redis, API, and 2 workers
 docker-compose up --build
 
 # Submit a task
 curl -X POST "http://localhost:8000/process-image?image_url=test.jpg"
 
-# Check status
-curl "http://localhost:8000/status/{task_id}"
+# Check task status
+curl "http://localhost:8000/status/<task_id>"
 
 # Scale workers
 docker-compose up --scale worker=3
 
-# Monitor health
+# Health + observability
 curl "http://localhost:8000/health"
 
-# Inspect stream directly
+# Inspect the stream directly
 redis-cli XINFO STREAM task_stream
 redis-cli XINFO GROUPS task_stream
 redis-cli XPENDING task_stream workers
+redis-cli XLEN dead_letter_stream
 ```
+
+## Configuration
+
+All settings are env vars; defaults live in `worker/config.py` and `app/main.py`.
+
+| Variable                       | Default               | Purpose                                              |
+| ------------------------------ | --------------------- | ---------------------------------------------------- |
+| `REDIS_HOST` / `REDIS_PORT`    | `localhost` / `6379`  | Redis connection                                     |
+| `STREAM_NAME`                  | `task_stream`         | Main task stream                                     |
+| `CONSUMER_GROUP`               | `workers`             | Consumer group name                                  |
+| `CONSUMER_NAME`                | `$HOSTNAME`           | Per-worker identity                                  |
+| `BLOCK_MS`                     | `5000`                | `XREADGROUP` block timeout                           |
+| `STALE_MESSAGE_THRESHOLD_MS`   | `30000`               | Idle time before `XAUTOCLAIM` reassigns a message    |
+| `MAX_RETRIES`                  | `1`                   | Delivery attempts before moving to DLQ               |
+| `DLQ_STREAM_NAME`              | `dead_letter_stream`  | DLQ stream name                                      |
+| `ALERT_HIGH_PENDING_THRESHOLD` | `100`                 | Health alert: pending count                          |
+| `ALERT_STALE_MESSAGE_MS`       | `60000`               | Health alert: message idle time                      |
+| `ALERT_IDLE_CONSUMER_MS`       | `300000`              | Health alert: consumer idle time                     |
+
+> Note: `task_processor.py` simulates a 30% failure rate and 1–3s processing time to exercise the retry/DLQ path.
+
+## Lists vs Streams
+
+This project is the counterpart to a Redis Lists implementation. Streams remove most of the custom coordination code:
+
+| Aspect             | Lists                                   | Streams (this project)             |
+| ------------------ | --------------------------------------- | ---------------------------------- |
+| Message delivery   | `BLMOVE` (+ ZADD for processing set)    | `XREADGROUP` (single op)           |
+| Consumer tracking  | Custom processing ZSET + lease tokens   | Built-in consumer groups           |
+| Visibility timeout | Sorted-set scores + Lua                 | Built-in via `XPENDING` idle time  |
+| Stale recovery     | Custom reaper loop                      | `XAUTOCLAIM`                       |
+| Retry counting     | Manual, stored in task data             | Native `times_delivered`           |
+| Message history    | Lost after pop                          | Retained until trimmed             |
+| Observability      | Hand-rolled                             | `XINFO STREAM` / `GROUPS` / `CONSUMERS` |
+
+See `spec/COMPARISON.md` for a deeper dive.
 
 ## License
 
-MIT License
+MIT
